@@ -52,6 +52,24 @@ IPAddress apSubnet(255, 255, 255, 0);
 // LED flash integrado (GPIO4) - opcional, se puede controlar desde la web
 #define FLASH_LED_GPIO     4
 
+// ---------------------------------------------------------------------------
+// Pines de motores - puente H L298N (tracción diferencial)
+// ENA/ENB del L298N están puenteados a 5V (siempre habilitados), por eso
+// alcanza con manejar IN1/IN2 de cada motor a velocidad fija, sin PWM.
+// ---------------------------------------------------------------------------
+#define MOTOR_IZQ_IN1     12
+#define MOTOR_IZQ_IN2     13
+#define MOTOR_DER_IN1     14
+#define MOTOR_DER_IN2     15
+
+enum MotorDir { MOTOR_STOP, MOTOR_FORWARD, MOTOR_BACKWARD };
+
+// Watchdog de movimiento: si no llega un comando de /move en este tiempo
+// (por ejemplo por un corte de WiFi) se frenan los motores solos.
+#define MOVE_TIMEOUT_MS   800
+volatile unsigned long lastMoveCmdMs = 0;
+volatile bool motorsRunning = false;
+
 httpd_handle_t pageServer   = NULL;
 httpd_handle_t streamServer = NULL;
 
@@ -126,6 +144,39 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   }
   button:active { background: #334351; }
   button.active { background: #3a6ea5; border-color: #3a6ea5; }
+
+  .dpad-wrap {
+    margin: 0 0 30px;
+    padding: 0 12px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .dpad-title {
+    font-size: 0.75rem;
+    color: #7a8a97;
+    letter-spacing: 1px;
+  }
+  .dpad {
+    display: grid;
+    grid-template-columns: 56px 56px 56px;
+    grid-template-rows: 56px 56px 56px;
+    gap: 6px;
+  }
+  .dpad-btn {
+    font-size: 1.3rem;
+    padding: 0;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .dpad-btn:active, .dpad-btn.pressed { background: #3a6ea5; border-color: #3a6ea5; }
+  .dpad-up    { grid-area: 1 / 2 / 2 / 3; }
+  .dpad-left  { grid-area: 2 / 1 / 3 / 2; }
+  .dpad-stop  { grid-area: 2 / 2 / 3 / 3; }
+  .dpad-right { grid-area: 2 / 3 / 3 / 4; }
+  .dpad-down  { grid-area: 3 / 2 / 4 / 3; }
 </style>
 </head>
 <body>
@@ -146,6 +197,17 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <option value="6" selected>Resolución: Normal (VGA)</option>
       <option value="4">Resolución: Baja (QVGA)</option>
     </select>
+  </div>
+
+  <div class="dpad-wrap">
+    <div class="dpad-title">MOVIMIENTO</div>
+    <div class="dpad">
+      <button class="dpad-btn dpad-up"    data-dir="forward">▲</button>
+      <button class="dpad-btn dpad-left"  data-dir="left">◀</button>
+      <button class="dpad-btn dpad-stop"  data-dir="stop">■</button>
+      <button class="dpad-btn dpad-right" data-dir="right">▶</button>
+      <button class="dpad-btn dpad-down"  data-dir="backward">▼</button>
+    </div>
   </div>
 
 <script>
@@ -178,6 +240,58 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   function setResolution(val) {
     fetch('/control?var=framesize&val=' + val);
   }
+
+  // D-pad de movimiento: al presionar se manda la dirección y se reenvía
+  // cada 400ms mientras se mantiene (keepalive) para sostener el watchdog
+  // de seguridad del firmware (frena solo si deja de recibir comandos).
+  let currentDir = 'stop';
+  let keepAliveTimer = null;
+
+  function sendMove(dir) {
+    fetch('/move?dir=' + dir);
+  }
+
+  function startMove(dir) {
+    if (dir === 'stop' || dir === currentDir) return;
+    currentDir = dir;
+    sendMove(dir);
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = setInterval(() => sendMove(currentDir), 400);
+  }
+
+  function stopMove() {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+    if (currentDir === 'stop') return;
+    currentDir = 'stop';
+    sendMove('stop');
+  }
+
+  document.querySelectorAll('.dpad-btn').forEach((btn) => {
+    const dir = btn.dataset.dir;
+    if (dir === 'stop') {
+      btn.addEventListener('click', stopMove);
+      return;
+    }
+    btn.addEventListener('pointerdown', (e) => { e.preventDefault(); startMove(dir); });
+    btn.addEventListener('pointerup', stopMove);
+    btn.addEventListener('pointerleave', stopMove);
+    btn.addEventListener('pointercancel', stopMove);
+  });
+
+  // Teclado (flechas / WASD) para manejar desde PC sin tocar la pantalla.
+  const KEY_DIR = {
+    ArrowUp: 'forward', w: 'forward', W: 'forward',
+    ArrowDown: 'backward', s: 'backward', S: 'backward',
+    ArrowLeft: 'left', a: 'left', A: 'left',
+    ArrowRight: 'right', d: 'right', D: 'right'
+  };
+  window.addEventListener('keydown', (e) => {
+    if (KEY_DIR[e.key]) startMove(KEY_DIR[e.key]);
+  });
+  window.addEventListener('keyup', (e) => {
+    if (KEY_DIR[e.key]) stopMove();
+  });
 </script>
 </body>
 </html>
@@ -227,6 +341,53 @@ static esp_err_t control_handler(httpd_req_t *req) {
   if (s != NULL && strcmp(varName, "framesize") == 0) {
     s->set_framesize(s, (framesize_t)val);
   }
+
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_send(req, "ok", 2);
+}
+
+// ---------------------------------------------------------------------------
+// Control de motores (puente H L298N) - tracción diferencial
+// ---------------------------------------------------------------------------
+static void setMotor(int in1, int in2, MotorDir dir) {
+  digitalWrite(in1, dir == MOTOR_FORWARD  ? HIGH : LOW);
+  digitalWrite(in2, dir == MOTOR_BACKWARD ? HIGH : LOW);
+}
+
+// dir: "forward" | "backward" | "left" | "right" | "stop"
+// Para girar en el lugar, una rueda va adelante y la otra atrás.
+static void driveRover(const char *dir) {
+  if (strcmp(dir, "forward") == 0) {
+    setMotor(MOTOR_IZQ_IN1, MOTOR_IZQ_IN2, MOTOR_FORWARD);
+    setMotor(MOTOR_DER_IN1, MOTOR_DER_IN2, MOTOR_FORWARD);
+  } else if (strcmp(dir, "backward") == 0) {
+    setMotor(MOTOR_IZQ_IN1, MOTOR_IZQ_IN2, MOTOR_BACKWARD);
+    setMotor(MOTOR_DER_IN1, MOTOR_DER_IN2, MOTOR_BACKWARD);
+  } else if (strcmp(dir, "left") == 0) {
+    setMotor(MOTOR_IZQ_IN1, MOTOR_IZQ_IN2, MOTOR_BACKWARD);
+    setMotor(MOTOR_DER_IN1, MOTOR_DER_IN2, MOTOR_FORWARD);
+  } else if (strcmp(dir, "right") == 0) {
+    setMotor(MOTOR_IZQ_IN1, MOTOR_IZQ_IN2, MOTOR_FORWARD);
+    setMotor(MOTOR_DER_IN1, MOTOR_DER_IN2, MOTOR_BACKWARD);
+  } else {
+    setMotor(MOTOR_IZQ_IN1, MOTOR_IZQ_IN2, MOTOR_STOP);
+    setMotor(MOTOR_DER_IN1, MOTOR_DER_IN2, MOTOR_STOP);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Handler: /move?dir=forward|backward|left|right|stop
+// ---------------------------------------------------------------------------
+static esp_err_t move_handler(httpd_req_t *req) {
+  char query[32];
+  char dir[16] = "stop";
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+    httpd_query_key_value(query, "dir", dir, sizeof(dir));
+  }
+
+  driveRover(dir);
+  motorsRunning = (strcmp(dir, "stop") != 0);
+  lastMoveCmdMs = millis();
 
   httpd_resp_set_type(req, "text/plain");
   return httpd_resp_send(req, "ok", 2);
@@ -311,11 +472,18 @@ void startCameraServer() {
     .handler = control_handler,
     .user_ctx = NULL
   };
+  httpd_uri_t move_uri = {
+    .uri = "/move",
+    .method = HTTP_GET,
+    .handler = move_handler,
+    .user_ctx = NULL
+  };
 
   if (httpd_start(&pageServer, &config) == ESP_OK) {
     httpd_register_uri_handler(pageServer, &index_uri);
     httpd_register_uri_handler(pageServer, &flash_uri);
     httpd_register_uri_handler(pageServer, &control_uri);
+    httpd_register_uri_handler(pageServer, &move_uri);
     Serial.println("Servidor de pagina (puerto 80): OK");
   } else {
     Serial.println("Servidor de pagina (puerto 80): FALLO al iniciar");
@@ -409,6 +577,12 @@ void setup() {
   pinMode(FLASH_LED_GPIO, OUTPUT);
   digitalWrite(FLASH_LED_GPIO, LOW);
 
+  pinMode(MOTOR_IZQ_IN1, OUTPUT);
+  pinMode(MOTOR_IZQ_IN2, OUTPUT);
+  pinMode(MOTOR_DER_IN1, OUTPUT);
+  pinMode(MOTOR_DER_IN2, OUTPUT);
+  driveRover("stop"); // motores detenidos al arrancar
+
   if (!initCamera()) {
     Serial.println("No se pudo inicializar la camara. Revisar conexiones/placa seleccionada.");
   }
@@ -429,5 +603,12 @@ void setup() {
 
 void loop() {
   // Todo el trabajo lo hacen los handlers HTTP (tareas internas del esp_http_server).
-  delay(10000);
+  // Watchdog de movimiento: si dejan de llegar comandos de /move (por un
+  // corte de WiFi, por ejemplo) se frenan los motores solos.
+  if (motorsRunning && (millis() - lastMoveCmdMs > MOVE_TIMEOUT_MS)) {
+    driveRover("stop");
+    motorsRunning = false;
+    Serial.println("Motores detenidos por timeout de seguridad (sin señal).");
+  }
+  delay(100);
 }

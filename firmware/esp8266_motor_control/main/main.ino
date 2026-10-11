@@ -172,6 +172,31 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     color: #7fdc8c;
     margin-top: 4px;
   }
+  .signal {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    gap: 2px;
+    margin-top: 6px;
+  }
+  .signal-bar {
+    width: 5px;
+    border-radius: 1px;
+    background: #334351;
+  }
+  .signal-bar.on { background: #7fdc8c; }
+  .signal-bar.on.warn { background: #e0b84a; }
+  .signal-bar.on.bad { background: #e05a5a; }
+  .signal-bar:nth-child(1) { height: 6px; }
+  .signal-bar:nth-child(2) { height: 10px; }
+  .signal-bar:nth-child(3) { height: 14px; }
+  .signal-bar:nth-child(4) { height: 18px; }
+  .signal-ms {
+    font-size: 0.65rem;
+    color: #7a8a97;
+    margin-left: 4px;
+    align-self: center;
+  }
   .warning {
     display: none;
     width: 100%;
@@ -253,6 +278,13 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <header>
     <h1>rover-tito</h1>
     <div class="status" id="status">conectando...</div>
+    <div class="signal" id="signal" title="calidad de señal WiFi (estimada por latencia, el ESP8266 no reporta RSSI de clientes en modo AP)">
+      <span class="signal-bar"></span>
+      <span class="signal-bar"></span>
+      <span class="signal-bar"></span>
+      <span class="signal-bar"></span>
+      <span class="signal-ms" id="signalMs"></span>
+    </div>
   </header>
 
   <div class="dpad-wrap">
@@ -372,11 +404,37 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
   // Avisa si el expansor PCF8574 no responde por I2C (cableado/alimentación).
   const pcfWarningEl = document.getElementById('pcfWarning');
+
+  // Medidor de señal WiFi: el ESP8266 en modo Access Point no expone el RSSI
+  // de los clientes conectados (el SDK no lo reporta para el softAP), así
+  // que se estima la calidad de la conexión por la latencia (round-trip) del
+  // propio polling de /status. Es una aproximación razonable: WiFi débil
+  // produce respuestas más lentas o fallidas antes de perderse del todo.
+  const signalBars = document.querySelectorAll('#signal .signal-bar');
+  const signalMsEl = document.getElementById('signalMs');
+
+  function setSignal(bars, cls, label) {
+    signalBars.forEach((bar, i) => {
+      bar.classList.toggle('on', i < bars);
+      bar.classList.remove('warn', 'bad');
+      if (i < bars && cls) bar.classList.add(cls);
+    });
+    signalMsEl.textContent = label;
+  }
+
   function pollStatus() {
+    const start = performance.now();
     fetch('/status')
       .then((r) => r.json())
-      .then((data) => { pcfWarningEl.classList.toggle('show', !data.pcf8574); })
-      .catch(() => {});
+      .then((data) => {
+        const rtt = Math.round(performance.now() - start);
+        pcfWarningEl.classList.toggle('show', !data.pcf8574);
+        if (rtt < 100) setSignal(4, null, rtt + 'ms');
+        else if (rtt < 250) setSignal(3, null, rtt + 'ms');
+        else if (rtt < 600) setSignal(2, 'warn', rtt + 'ms');
+        else setSignal(1, 'bad', rtt + 'ms');
+      })
+      .catch(() => { setSignal(0, 'bad', 'sin señal'); });
   }
   pollStatus();
   setInterval(pollStatus, 1000);

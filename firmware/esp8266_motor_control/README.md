@@ -1,7 +1,8 @@
 # ESP8266 — Access Point con control de motores (sin cámara)
 
 Este sketch hace que un módulo **ESP8266** (NodeMCU / Wemos D1 Mini), al encenderse,
-cree su propia red WiFi (modo *Access Point*) y sirva una página web con un D-pad
+cree su propia red WiFi (modo *Access Point*) y sirva una página web con un
+joystick virtual (estilo juego de carreras) o, si se prefiere, un D-pad clásico
 para manejar un rover de tracción diferencial a través de un puente H **L298N**,
 cuyos pines IN1-IN4 se manejan a través de un expansor de I/O **PCF8574** por el
 bus I2C (no se conectan directo a GPIOs del ESP8266).
@@ -12,11 +13,15 @@ desde el celular o la PC. No tiene cámara (para eso ver `../esp32cam_wifi_ap_st
 
 1. Al bootear, crea la red WiFi `rover-tito` (contraseña `rover1234` por defecto).
 2. Levanta un servidor web en `http://192.168.4.1/`.
-3. La página muestra un D-pad (▲◀■▶▼) para avanzar, retroceder, girar a la
-   izquierda/derecha (giro en el lugar) o detenerse. También se puede manejar
-   con las flechas o WASD del teclado.
-4. Si deja de recibir comandos de movimiento por más de 800 ms (por ejemplo por
-   un corte de WiFi), el firmware frena los motores solo (watchdog de seguridad).
+3. La página muestra un joystick virtual (arrastrar con el dedo o el mouse) que
+   da velocidad progresiva por rueda - avanzar + doblar traza una curva abierta,
+   no un giro en el lugar. Con el botón ⚙ (opciones) se puede cambiar a un D-pad
+   clásico (▲◀■▶▼, giro en el lugar) y también invertir los controles. Ambos
+   modos se pueden manejar con el mouse/dedo o con las flechas/WASD del teclado.
+   La elección de modo e inversión queda guardada en el navegador.
+4. Si deja de recibir comandos de movimiento por más de 500 ms (por ejemplo por
+   un corte de WiFi, o por alejarse del alcance del AP), el firmware frena los
+   motores solo (watchdog de seguridad) - no hace falta salir a perseguirlo.
 5. Si el expansor PCF8574 no responde por I2C (desconectado, mal cableado o sin
    alimentación), la página muestra un aviso en rojo arriba de todo.
 6. Al arrancar (si detecta el PCF8574), hace un autotesteo: activa IN1, IN2,
@@ -116,7 +121,14 @@ const int   AP_MAX_CONN = 4;
 Y el tiempo del watchdog de seguridad:
 
 ```cpp
-#define MOVE_TIMEOUT_MS 800   // ms sin recibir /move antes de frenar solo
+#define MOVE_TIMEOUT_MS 500   // ms sin recibir /drive antes de frenar solo
+```
+
+Y el PWM por software (ver "Notas" más abajo):
+
+```cpp
+#define PWM_PERIOD_MS    20   // período del PWM (50Hz)
+#define PWM_MIN_DUTY_PCT 30   // duty mínimo para que el motor arranque
 ```
 
 ## Uso
@@ -126,7 +138,9 @@ Y el tiempo del watchdog de seguridad:
    para los motores, no uses el 5V del ESP8266 para alimentarlos).
 3. Desde el celular/PC, conectarse a la red WiFi `rover-tito`.
 4. Abrir el navegador en `http://192.168.4.1/`.
-5. Usar el D-pad (o las flechas/WASD del teclado) para manejar el rover.
+5. Usar el joystick (o las flechas/WASD del teclado) para manejar el rover.
+   Tocar el botón ⚙ arriba a la derecha para cambiar a D-pad clásico o
+   invertir los controles.
 
 ## Notas
 
@@ -134,7 +148,11 @@ Y el tiempo del watchdog de seguridad:
   externa; si en el futuro se necesita que el ESP8266 se conecte a una red
   existente (modo estación) en lugar de crear la suya, hay que cambiar
   `WiFi.mode(WIFI_AP)` por `WIFI_STA` y usar `WiFi.begin(ssid, password)`.
-- Este sketch no usa PWM/velocidad variable: cada motor va a fondo o detenido,
-  porque ENA/ENB del L298N están puenteados a 5V. Si se agregan esos pines al
-  ESP8266 para variar la velocidad, hay que generar PWM con `analogWrite()`
-  sobre ENA/ENB (no sobre IN1-IN4).
+- ENA/ENB del L298N están puenteados a 5V (siempre habilitados): no hay PWM de
+  hardware. La velocidad progresiva por rueda (necesaria para las curvas
+  abiertas del joystick) se logra con PWM por software, prendiendo y apagando
+  IN1/IN2 de cada rueda a 50Hz vía el PCF8574 (ver `updateMotorPWM()` en
+  `main.ino`). Si en algún momento se quiere PWM "de verdad" (más fino, sin
+  pasar por I2C), se puede cortar el jumper ENA/ENB de la placa L298N y
+  cablearlos a 2 GPIO libres del ESP8266 con `analogWrite()`, dejando IN1-IN4
+  del PCF8574 solo como dirección fija.
